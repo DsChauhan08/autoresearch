@@ -43,6 +43,7 @@ MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
 VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
 VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
 VOCAB_SIZE = 8192
+BYTES_PER_GIB = 1024 ** 3
 
 # BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
@@ -54,12 +55,24 @@ BOS_TOKEN = "<|reserved_0|>"
 # Data download
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
+class DataBudgetExceededError(RuntimeError):
+    pass
+
+
+def shard_filename(index):
+    return f"shard_{index:05d}.parquet"
+
+
+def shard_filepath(index):
+    return os.path.join(DATA_DIR, shard_filename(index))
+
+
+def download_single_shard(index, max_bytes=None):
+    """Download one parquet shard with retries. Returns status string."""
     filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
+    filepath = shard_filepath(index)
     if os.path.exists(filepath):
-        return True
+        return "exists"
 
     url = f"{BASE_URL}/{filename}"
     max_attempts = 5
@@ -69,12 +82,27 @@ def download_single_shard(index):
             response.raise_for_status()
             temp_path = filepath + ".tmp"
             with open(temp_path, "wb") as f:
+                written = 0
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if chunk:
+                        if max_bytes is not None and written + len(chunk) > max_bytes:
+                            raise DataBudgetExceededError(
+                                f"{filename} exceeds remaining data budget ({max_bytes / BYTES_PER_GIB:.2f} GiB)"
+                            )
                         f.write(chunk)
+                        written += len(chunk)
             os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
+            print(f"  Downloaded {filename} ({written / BYTES_PER_GIB:.3f} GiB)")
+            return "downloaded"
+        except DataBudgetExceededError as e:
+            print(f"  Skipping {filename}: {e}")
+            for path in [filepath + ".tmp", filepath]:
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+            return "budget_exceeded"
         except (requests.RequestException, IOError) as e:
             print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
             for path in [filepath + ".tmp", filepath]:
@@ -85,32 +113,85 @@ def download_single_shard(index):
                         pass
             if attempt < max_attempts:
                 time.sleep(2 ** attempt)
-    return False
+    return "failed"
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
+def _shards_total_size(ids):
+    total = 0
+    for i in ids:
+        path = shard_filepath(i)
+        if os.path.exists(path):
+            total += os.path.getsize(path)
+    return total
+
+
+def download_data(num_shards, download_workers=8, max_data_gb=10.0):
+    """Download training shards + pinned validation shard with optional strict size cap."""
     os.makedirs(DATA_DIR, exist_ok=True)
     num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
+    train_ids = list(range(num_train))
+    ids = [VAL_SHARD] + [i for i in train_ids if i != VAL_SHARD]
+
+    if max_data_gb is not None and max_data_gb >= 0:
+        max_data_bytes = int(max_data_gb * BYTES_PER_GIB)
+    else:
+        max_data_bytes = None
 
     # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
+    existing = sum(1 for i in ids if os.path.exists(shard_filepath(i)))
     if existing == len(ids):
         print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
         return
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
+    if max_data_bytes is None:
+        needed = len(ids) - existing
+        print(f"Data: downloading {needed} shards ({existing} already exist)...")
 
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
+        workers = max(1, min(download_workers, needed))
+        with Pool(processes=workers) as pool:
+            results = pool.map(download_single_shard, ids)
 
-    ok = sum(1 for r in results if r)
+        ok = sum(1 for r in results if r in {"exists", "downloaded"})
+        print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+        return
+
+    current_bytes = _shards_total_size(ids)
+    print(f"Data cap: {max_data_gb:.2f} GiB")
+    print(f"Data: currently have {current_bytes / BYTES_PER_GIB:.3f} GiB across selected shards")
+    if current_bytes >= max_data_bytes:
+        print("Data: cap already reached; no additional shards will be downloaded.")
+        return
+
+    print(f"Data: downloading up to cap ({existing} shards already exist)...")
+    for i in ids:
+        path = shard_filepath(i)
+        if os.path.exists(path):
+            continue
+
+        remaining = max_data_bytes - current_bytes
+        if remaining <= 0:
+            print("Data: cap reached; stopping downloads.")
+            break
+
+        status = download_single_shard(i, max_bytes=remaining)
+        if status == "downloaded":
+            shard_bytes = os.path.getsize(path)
+            current_bytes += shard_bytes
+        elif status == "budget_exceeded":
+            if i == VAL_SHARD:
+                raise RuntimeError(
+                    f"Validation shard {shard_filename(VAL_SHARD)} could not fit within --max-data-gb={max_data_gb}"
+                )
+            print("Data: next shard does not fit in remaining budget; stopping downloads.")
+            break
+        elif status == "failed":
+            if i == VAL_SHARD:
+                raise RuntimeError("Validation shard download failed after retries.")
+            print(f"Data: continuing after failed training shard {shard_filename(i)}")
+
+    ok = sum(1 for i in ids if os.path.exists(shard_filepath(i)))
     print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+    print(f"Data: total selected shard size {current_bytes / BYTES_PER_GIB:.3f} GiB")
 
 # ---------------------------------------------------------------------------
 # Tokenizer training
@@ -248,7 +329,11 @@ class Tokenizer:
 def get_token_bytes(device="cpu"):
     path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
     with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+        token_bytes = torch.load(f, map_location="cpu")
+    target = torch.device(device)
+    if target.type == "cpu":
+        return token_bytes
+    return token_bytes.to(target)
 
 
 def _document_batches(split, tokenizer_batch_size=128):
@@ -273,7 +358,7 @@ def _document_batches(split, tokenizer_batch_size=128):
         epoch += 1
 
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def make_dataloader(tokenizer, B, T, split, buffer_size=1000, device="cuda", tokenizer_threads=8):
     """
     BOS-aligned dataloader with best-fit packing.
     Every row starts with BOS. Documents packed using best-fit to minimize cropping.
@@ -281,6 +366,7 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
     100% utilization (no padding).
     """
     assert split in ["train", "val"]
+    device = torch.device(device)
     row_capacity = T + 1
     batches = _document_batches(split)
     bos_token = tokenizer.get_bos_token_id()
@@ -290,17 +376,23 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
     def refill_buffer():
         nonlocal epoch
         doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
+        token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
         doc_buffer.extend(token_lists)
 
     # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
+    pin_memory = device.type in {"cuda", "xpu"}
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=pin_memory)
     cpu_inputs = cpu_buffer[:B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+    if device.type == "cpu":
+        inputs = cpu_inputs
+        targets = cpu_targets
+        device_buffer = None
+    else:
+        device_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
+        inputs = device_buffer[:B * T].view(B, T)
+        targets = device_buffer[B * T:].view(B, T)
 
     while True:
         for row_idx in range(B):
@@ -333,7 +425,9 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+        if device_buffer is not None:
+            non_blocking = device.type in {"cuda", "xpu"}
+            device_buffer.copy_(cpu_buffer, non_blocking=non_blocking)
         yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
@@ -341,7 +435,7 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def evaluate_bpb(model, tokenizer, batch_size, device="cuda", tokenizer_threads=8):
     """
     Bits per byte (BPB): vocab size-independent evaluation metric.
     Sums per-token cross-entropy (in nats), sums target byte lengths,
@@ -349,8 +443,10 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
+    token_bytes = get_token_bytes(device=device)
+    val_loader = make_dataloader(
+        tokenizer, batch_size, MAX_SEQ_LEN, "val", device=device, tokenizer_threads=tokenizer_threads
+    )
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
     total_bytes = 0
@@ -372,6 +468,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
     parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
     parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser.add_argument(
+        "--max-data-gb",
+        type=float,
+        default=10.0,
+        help="Strict cap on total downloaded selected shard size in GiB (-1 for unlimited).",
+    )
     args = parser.parse_args()
 
     num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
@@ -380,7 +482,8 @@ if __name__ == "__main__":
     print()
 
     # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
+    max_data_gb = None if args.max_data_gb < 0 else args.max_data_gb
+    download_data(num_shards, download_workers=args.download_workers, max_data_gb=max_data_gb)
     print()
 
     # Step 2: Train tokenizer

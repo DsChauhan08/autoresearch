@@ -1,6 +1,6 @@
 """
-Autoresearch pretraining script. Single-GPU, single-file.
-Cherry-picked and simplified from nanochat.
+Autoresearch pretraining script.
+Supports CUDA, CPU, and Vulkan-capable PyTorch builds.
 Usage: uv run train.py
 """
 
@@ -8,6 +8,7 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
+import contextlib
 import gc
 import math
 import time
@@ -17,13 +18,229 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
-
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+
+# ---------------------------------------------------------------------------
+# Device/runtime selection
+# ---------------------------------------------------------------------------
+
+FA3_INTERFACE = None
+ATTN_BACKEND = "sdpa"
+
+
+def _format_error(error):
+    first_line = str(error).splitlines()[0] if str(error) else repr(error)
+    return f"{type(error).__name__}: {first_line}"
+
+
+def _env_flag(name, default):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name, default, min_value=1):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(min_value, value)
+
+
+def _probe_vulkan_device():
+    try:
+        _ = torch.tensor([1.0], device="vulkan")
+    except Exception as e:
+        return False, e
+    return True, None
+
+
+def _supports_vulkan_device():
+    ok, _ = _probe_vulkan_device()
+    return ok
+
+
+def _training_smoke_test(device):
+    try:
+        emb = nn.Embedding(32, 16).to(device)
+        idx = torch.randint(0, 32, (2, 8), device=device, dtype=torch.long)
+        e = emb(idx).pow(2).mean()
+        e.backward()
+        x = torch.randn(2, 8, device=device, requires_grad=True)
+        w = torch.randn(8, 8, device=device, requires_grad=True)
+        y = (x @ w).pow(2).mean()
+        y.backward()
+        q = torch.randn(1, 2, 8, 16, device=device, requires_grad=True)
+        k = torch.randn(1, 2, 8, 16, device=device, requires_grad=True)
+        v = torch.randn(1, 2, 8, 16, device=device, requires_grad=True)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+        causal_mask = torch.triu(
+            torch.ones((q.size(-2), q.size(-2)), dtype=torch.bool, device=device),
+            diagonal=1,
+        )
+        scores = scores.masked_fill(causal_mask, float("-inf"))
+        z = torch.matmul(scores.softmax(dim=-1), v).mean()
+        z.backward()
+    except Exception as e:
+        return False, e
+    return True, None
+
+
+def pick_device(preference):
+    pref = preference.lower()
+    if pref not in {"auto", "cuda", "vulkan", "cpu"}:
+        raise ValueError(f"Invalid AUTORESEARCH_DEVICE={preference!r}; expected auto/cuda/vulkan/cpu")
+    candidates = []
+    if pref == "auto":
+        if torch.cuda.is_available():
+            candidates.append(torch.device("cuda"))
+        if _supports_vulkan_device():
+            candidates.append(torch.device("vulkan"))
+        candidates.append(torch.device("cpu"))
+    elif pref == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("AUTORESEARCH_DEVICE=cuda requested but CUDA is not available.")
+        candidates.append(torch.device("cuda"))
+    elif pref == "vulkan":
+        ok, error = _probe_vulkan_device()
+        if not ok:
+            raise RuntimeError(
+                "AUTORESEARCH_DEVICE=vulkan requested but Vulkan is not usable in this PyTorch build. "
+                f"First failure: {_format_error(error)}. "
+                "Build/install Vulkan-enabled PyTorch and verify with: python scripts/verify_vulkan_torch.py"
+            )
+        candidates.append(torch.device("vulkan"))
+    else:
+        candidates.append(torch.device("cpu"))
+
+    for device in candidates:
+        ok, err = _training_smoke_test(device)
+        if ok:
+            return device
+        print(f"Device {device} failed training smoke test: {_format_error(err)}")
+
+    raise RuntimeError("No viable training device found (CUDA/Vulkan/CPU).")
+
+
+def configure_host_resources(device):
+    cpu_count = os.cpu_count() or 4
+    if device.type == "cuda":
+        default_threads = max(1, cpu_count // 2)
+    else:
+        default_threads = max(1, cpu_count // 2)
+    torch_threads = _env_int("AUTORESEARCH_CPU_THREADS", default_threads, min_value=1)
+    interop_threads = _env_int("AUTORESEARCH_INTEROP_THREADS", max(1, min(4, torch_threads // 2)), min_value=1)
+    tokenizer_threads = _env_int("AUTORESEARCH_TOKENIZER_THREADS", max(1, min(8, torch_threads)), min_value=1)
+
+    torch.set_num_threads(torch_threads)
+    try:
+        torch.set_num_interop_threads(interop_threads)
+    except RuntimeError as e:
+        print(f"Could not set interop threads (continuing with existing setting): {e}")
+
+    nice_delta = _env_int("AUTORESEARCH_NICE", 10, min_value=0)
+    if nice_delta > 0:
+        try:
+            os.nice(nice_delta)
+            print(f"Adjusted process priority with nice +{nice_delta}")
+        except OSError as e:
+            print(f"Could not adjust process priority: {e}")
+
+    return tokenizer_threads
+
+
+def init_flash_attention(device):
+    global FA3_INTERFACE
+    FA3_INTERFACE = None
+    if device.type != "cuda":
+        return
+    try:
+        from kernels import get_kernel
+        cap = torch.cuda.get_device_capability()
+        repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+        FA3_INTERFACE = get_kernel(repo).flash_attn_interface
+        print(f"Attention backend: flash-attn ({repo})")
+    except Exception as e:
+        print(f"Attention backend: fallback SDPA (flash-attn unavailable: {e})")
+
+
+def _supports_sdpa(device, dtype):
+    try:
+        q = torch.randn(1, 2, 8, 16, device=device, dtype=dtype)
+        k = torch.randn(1, 2, 8, 16, device=device, dtype=dtype)
+        v = torch.randn(1, 2, 8, 16, device=device, dtype=dtype)
+        _ = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    except Exception:
+        return False
+    return True
+
+
+def _manual_causal_attention(q, k, v):
+    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+    mask = torch.triu(
+        torch.ones((q.size(-2), q.size(-2)), dtype=torch.bool, device=q.device),
+        diagonal=1,
+    )
+    scores = scores.masked_fill(mask, float("-inf"))
+    weights = scores.softmax(dim=-1)
+    return torch.matmul(weights, v)
+
+
+def pick_attention_backend(device):
+    if FA3_INTERFACE is not None:
+        return "fa3"
+    if _supports_sdpa(device, MODEL_DTYPE):
+        return "sdpa"
+    return "manual"
+
+
+def synchronize_device(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def max_memory_mb(device):
+    if device.type == "cuda":
+        return torch.cuda.max_memory_allocated() / 1024 / 1024
+    return 0.0
+
+
+def pick_model_dtype(device, preference):
+    pref = preference.lower()
+    if pref not in {"auto", "float32", "bfloat16"}:
+        raise ValueError(f"Invalid AUTORESEARCH_DTYPE={preference!r}; expected auto/float32/bfloat16")
+    if pref == "float32":
+        return torch.float32
+    if pref == "bfloat16":
+        return torch.bfloat16
+    if device.type == "cuda":
+        return torch.bfloat16
+    return torch.float32
+
+
+MODEL_DTYPE = torch.float32
+
+
+def clamp_hyperparams_for_device(device):
+    global TOTAL_BATCH_SIZE, DEVICE_BATCH_SIZE, DEPTH, WINDOW_PATTERN
+    if device.type in {"cpu", "vulkan"}:
+        if WINDOW_PATTERN != "L":
+            print("Adjusting WINDOW_PATTERN to 'L' for CPU/Vulkan stability.")
+            WINDOW_PATTERN = "L"
+        if DEPTH > 6:
+            print(f"Reducing DEPTH from {DEPTH} to 6 for CPU/Vulkan defaults.")
+            DEPTH = 6
+        if DEVICE_BATCH_SIZE > 8:
+            print(f"Reducing DEVICE_BATCH_SIZE from {DEVICE_BATCH_SIZE} to 8 for CPU/Vulkan defaults.")
+            DEVICE_BATCH_SIZE = 8
+        max_tokens = 2**14
+        if TOTAL_BATCH_SIZE > max_tokens:
+            print(f"Reducing TOTAL_BATCH_SIZE from {TOTAL_BATCH_SIZE} to {max_tokens} for CPU/Vulkan defaults.")
+            TOTAL_BATCH_SIZE = max_tokens
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -90,7 +307,20 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if FA3_INTERFACE is not None:
+            y = FA3_INTERFACE.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        else:
+            q_sdpa = q.transpose(1, 2)
+            k_sdpa = k.transpose(1, 2)
+            v_sdpa = v.transpose(1, 2)
+            if self.n_kv_head != self.n_head:
+                rep = self.n_head // self.n_kv_head
+                k_sdpa = k_sdpa.repeat_interleave(rep, dim=1)
+                v_sdpa = v_sdpa.repeat_interleave(rep, dim=1)
+            if ATTN_BACKEND == "sdpa":
+                y = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, is_causal=True).transpose(1, 2)
+            else:
+                y = _manual_causal_attention(q_sdpa, k_sdpa, v_sdpa).transpose(1, 2)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -175,10 +405,9 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
+        self.transformer.wte.to(dtype=MODEL_DTYPE)
         for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
+            ve.to(dtype=MODEL_DTYPE)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
@@ -188,7 +417,7 @@ class GPT(nn.Module):
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16()
+        cos, sin = cos.to(dtype=MODEL_DTYPE), sin.to(dtype=MODEL_DTYPE)
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         return cos, sin
 
@@ -233,8 +462,16 @@ class GPT(nn.Module):
             'transformer_matrices': transformer_matrices, 'scalars': scalars, 'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+    def setup_optimizer(
+        self,
+        unembedding_lr=0.004,
+        embedding_lr=0.2,
+        matrix_lr=0.02,
+        weight_decay=0.0,
+        adam_betas=(0.8, 0.95),
+        scalar_lr=0.5,
+        use_muon=True,
+    ):
         model_dim = self.config.n_embd
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
@@ -248,19 +485,74 @@ class GPT(nn.Module):
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
         param_groups = [
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(
+                kind="adamw",
+                params=lm_head_params,
+                lr=unembedding_lr * dmodel_lr_scale,
+                betas=adam_betas,
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=embedding_params,
+                lr=embedding_lr * dmodel_lr_scale,
+                betas=adam_betas,
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=value_embeds_params,
+                lr=embedding_lr * dmodel_lr_scale,
+                betas=adam_betas,
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=resid_params,
+                lr=scalar_lr * 0.01,
+                betas=adam_betas,
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=x0_params,
+                lr=scalar_lr,
+                betas=(0.96, 0.95),
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
         ]
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
-            ))
-        optimizer = MuonAdamW(param_groups)
+        if use_muon:
+            for shape in sorted({p.shape for p in matrix_params}):
+                group_params = [p for p in matrix_params if p.shape == shape]
+                param_groups.append(
+                    dict(
+                        kind="muon",
+                        params=group_params,
+                        lr=matrix_lr,
+                        momentum=0.95,
+                        ns_steps=5,
+                        beta2=0.95,
+                        weight_decay=weight_decay,
+                    )
+                )
+            optimizer = MuonAdamW(param_groups)
+        else:
+            param_groups.append(
+                dict(
+                    kind="adamw",
+                    params=matrix_params,
+                    lr=matrix_lr,
+                    betas=adam_betas,
+                    eps=1e-10,
+                    weight_decay=weight_decay,
+                )
+            )
+            optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
@@ -302,7 +594,6 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
@@ -313,7 +604,6 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
@@ -321,8 +611,9 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
     # Polar express orthogonalization
-    X = g.bfloat16()
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
+    X = g.to(dtype=MODEL_DTYPE)
+    eps = 1e-4 if MODEL_DTYPE == torch.bfloat16 else 1e-6
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + eps)
     if g.size(-2) > g.size(-1):
         for a, b, c in polar_express_coeffs[:ns_steps]:
             A = X.mT @ X
@@ -456,11 +747,38 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 t_start = time.time()
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+
+device_preference = os.getenv("AUTORESEARCH_DEVICE", "auto")
+device = pick_device(device_preference)
+if device.type == "cuda":
+    torch.cuda.manual_seed(42)
+print(f"Selected device: {device}")
+
+MODEL_DTYPE = pick_model_dtype(device, os.getenv("AUTORESEARCH_DTYPE", "auto"))
+print(f"Model dtype: {MODEL_DTYPE}")
+
+tokenizer_threads = configure_host_resources(device)
+init_flash_attention(device)
+ATTN_BACKEND = pick_attention_backend(device)
+print(f"Attention backend: {ATTN_BACKEND}")
+clamp_hyperparams_for_device(device)
+
+enable_compile_default = device.type == "cuda"
+ENABLE_COMPILE = _env_flag("AUTORESEARCH_COMPILE", enable_compile_default)
+USE_AMP = _env_flag("AUTORESEARCH_AMP", device.type == "cuda")
+USE_MUON = _env_flag("AUTORESEARCH_USE_MUON", device.type == "cuda")
+print(f"Torch compile: {ENABLE_COMPILE}")
+print(f"Autocast AMP: {USE_AMP}")
+print(f"Muon optimizer groups: {USE_MUON}")
+
+if device.type == "cuda":
+    torch.set_float32_matmul_precision("high")
+
+if USE_AMP:
+    autocast_dtype = torch.bfloat16 if MODEL_DTYPE == torch.bfloat16 else torch.float32
+    autocast_ctx = torch.amp.autocast(device_type=device.type, dtype=autocast_dtype)
+else:
+    autocast_ctx = contextlib.nullcontext()
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -483,6 +801,7 @@ with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
+model.to(dtype=MODEL_DTYPE)
 
 param_counts = model.num_scaling_params()
 print("Parameter counts:")
@@ -503,11 +822,20 @@ optimizer = model.setup_optimizer(
     adam_betas=ADAM_BETAS,
     matrix_lr=MATRIX_LR,
     weight_decay=WEIGHT_DECAY,
+    use_muon=USE_MUON,
 )
 
-model = torch.compile(model, dynamic=False)
+if ENABLE_COMPILE:
+    model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+train_loader = make_dataloader(
+    tokenizer,
+    DEVICE_BATCH_SIZE,
+    MAX_SEQ_LEN,
+    "train",
+    device=device,
+    tokenizer_threads=tokenizer_threads,
+)
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
@@ -541,7 +869,7 @@ total_training_time = 0
 step = 0
 
 while True:
-    torch.cuda.synchronize()
+    synchronize_device(device)
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
@@ -571,7 +899,7 @@ while True:
         print("FAIL")
         exit(1)
 
-    torch.cuda.synchronize()
+    synchronize_device(device)
     t1 = time.time()
     dt = t1 - t0
 
@@ -584,10 +912,17 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    mfu = float("nan")
+    mfu_text = "n/a"
     remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    print(
+        f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | "
+        f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | "
+        f"mfu: {mfu_text} | epoch: {epoch} | remaining: {remaining:.0f}s    ",
+        end="",
+        flush=True,
+    )
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
@@ -610,20 +945,26 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    val_bpb = evaluate_bpb(
+        model,
+        tokenizer,
+        DEVICE_BATCH_SIZE,
+        device=device,
+        tokenizer_threads=tokenizer_threads,
+    )
 
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+steady_state_mfu = float("nan")
+peak_vram_mb = max_memory_mb(device)
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"mfu_percent:      {steady_state_mfu:.2f}")
+print(f"mfu_percent:      {'n/a' if math.isnan(steady_state_mfu) else f'{steady_state_mfu:.2f}'}")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")

@@ -20,7 +20,8 @@ If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/s
 
 ## Quick start
 
-**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
+**Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/).  
+Runs on CPU by default, CUDA if available, and Vulkan when your PyTorch build is Vulkan-enabled.
 
 ```bash
 
@@ -30,14 +31,60 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # 2. Install dependencies
 uv sync
 
-# 3. Download data and train tokenizer (one-time, ~2 min)
-uv run prepare.py
+# 3. Download data and train tokenizer (one-time, capped to 10 GiB by default)
+uv run prepare.py --max-data-gb 10
 
 # 4. Manually run a single training experiment (~5 min)
 uv run train.py
 ```
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
+
+### Low-power CPU/iGPU profile
+
+If you want this to stay responsive for other tasks, run with explicit throttling knobs:
+
+```bash
+AUTORESEARCH_DEVICE=auto \
+AUTORESEARCH_CPU_THREADS=4 \
+AUTORESEARCH_INTEROP_THREADS=1 \
+AUTORESEARCH_TOKENIZER_THREADS=2 \
+AUTORESEARCH_NICE=12 \
+AUTORESEARCH_COMPILE=0 \
+AUTORESEARCH_AMP=0 \
+AUTORESEARCH_USE_MUON=0 \
+uv run train.py
+```
+
+`AUTORESEARCH_DEVICE=auto` tries CUDA, then Vulkan, then CPU.  
+Use `AUTORESEARCH_DEVICE=vulkan` to force Vulkan (fails fast if unsupported by your PyTorch build).
+
+### Vulkan workflow (build + run)
+
+If your distro PyTorch/uv environment does not include Vulkan operators, build a local Vulkan-enabled PyTorch wheel:
+
+```bash
+# optional once: install build deps (Ubuntu/Debian)
+sudo apt-get update
+sudo apt-get install -y build-essential git cmake ninja-build python3-dev python3-venv libvulkan-dev vulkan-tools
+
+# build and install torch with USE_VULKAN=1 into .venv-vulkan
+bash scripts/build_pytorch_vulkan.sh
+```
+
+Then verify and run:
+
+```bash
+source .venv-vulkan/bin/activate
+python scripts/verify_vulkan_torch.py
+bash scripts/run_vulkan.sh
+```
+
+Notes:
+
+- `scripts/verify_vulkan_torch.py` checks real tensor/operator behavior, not just `torch.device("vulkan")`.
+- If Vulkan still fails, run in CPU mode (`AUTORESEARCH_DEVICE=cpu`) while keeping the low-power thread limits.
+- Keep using `uv run prepare.py --max-data-gb 10` to preserve the 10 GiB data cap.
 
 ## Running the agent
 
@@ -66,7 +113,16 @@ pyproject.toml  — dependencies
 
 ## Platform support
 
-This code currently requires that you have a single NVIDIA GPU. In principle it is quite possible to support CPU, MPS and other platforms but this would also bloat the code. I'm not 100% sure that I want to take this on personally right now. People can reference (or have their agents reference) the full/parent nanochat repository that has wider platform support and shows the various solutions (e.g. a Flash Attention 3 kernels fallback implementation, generic device support, autodetection, etc.), feel free to create forks or discussions for other platforms and I'm happy to link to them here in the README in some new notable forks section or etc.
+`train.py` now supports device autodetection and fallback:
+
+- CUDA (with Flash Attention if available, SDPA fallback otherwise)
+- Vulkan (if your local PyTorch build is linked with Vulkan device support)
+- CPU (always available, lowest common denominator path)
+
+Notes:
+
+- Vulkan support depends on your PyTorch build, not just your system Vulkan driver.
+- `prepare.py` now enforces a strict dataset cap via `--max-data-gb` (default: `10`).
 
 Seeing as there seems to be a lot of interest in tinkering with autoresearch on much smaller compute platforms than an H100, a few extra words. If you're going to try running autoresearch on smaller computers (Macbooks etc.), I'd recommend one of the forks below. On top of this, here are some recommendations for how to tune the defaults for much smaller models for aspiring forks:
 

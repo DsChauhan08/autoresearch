@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT_DIR}"
+
+: "${AUTORESEARCH_CPU_THREADS:=4}"
+: "${AUTORESEARCH_INTEROP_THREADS:=1}"
+: "${AUTORESEARCH_TOKENIZER_THREADS:=2}"
+: "${AUTORESEARCH_NICE:=12}"
+: "${AUTORESEARCH_COMPILE:=0}"
+: "${AUTORESEARCH_AMP:=0}"
+: "${AUTORESEARCH_USE_MUON:=0}"
+
+export AUTORESEARCH_DEVICE=vulkan
+export AUTORESEARCH_CPU_THREADS
+export AUTORESEARCH_INTEROP_THREADS
+export AUTORESEARCH_TOKENIZER_THREADS
+export AUTORESEARCH_NICE
+export AUTORESEARCH_COMPILE
+export AUTORESEARCH_AMP
+export AUTORESEARCH_USE_MUON
+
+python scripts/verify_vulkan_torch.py
+uv run train.py
