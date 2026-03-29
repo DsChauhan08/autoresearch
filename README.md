@@ -80,9 +80,16 @@ python scripts/verify_vulkan_torch.py
 bash scripts/run_vulkan.sh
 ```
 
+Reinstall later from the exported prebuilt wheel (no rebuild needed):
+
+```bash
+bash scripts/install_pytorch_vulkan_wheel.sh
+```
+
 Notes:
 
 - `scripts/verify_vulkan_torch.py` checks real tensor/operator behavior, not just `torch.device("vulkan")`.
+- `scripts/build_pytorch_vulkan.sh` exports the built wheel into `dist/` for reuse.
 - If Vulkan still fails, run in CPU mode (`AUTORESEARCH_DEVICE=cpu`) while keeping the low-power thread limits.
 - Keep using `uv run prepare.py --max-data-gb 10` to preserve the 10 GiB data cap.
 
