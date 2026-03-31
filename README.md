@@ -20,8 +20,7 @@ If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/s
 
 ## Quick start
 
-**Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/).  
-Runs on CPU by default, CUDA if available, and Vulkan when your PyTorch build is Vulkan-enabled.
+**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
 
 ```bash
 
@@ -31,80 +30,14 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # 2. Install dependencies
 uv sync
 
-# 3. Download data and train tokenizer (one-time, capped to 10 GiB by default)
-uv run prepare.py --max-data-gb 10
+# 3. Download data and train tokenizer (one-time, ~2 min)
+uv run prepare.py
 
 # 4. Manually run a single training experiment (~5 min)
 uv run train.py
 ```
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
-
-### iGPU-first path (CPU/low-power devices)
-
-For systems with only integrated GPUs or low-power CPUs, use:
-
-```bash
-bash scripts/run_igpu.sh
-```
-
-This keeps host load low and uses `AUTORESEARCH_DEVICE=auto` (tries CUDA → Vulkan → CPU).
-
-### Vulkan iGPU quick entrypoint (recommended)
-
-If you want a frictionless Vulkan-specific flow on Linux:
-
-```bash
-# 1) setup Vulkan torch in .venv-vulkan (from dist wheel when available)
-bash scripts/igpu_vulkan.sh setup
-
-# 2) check Vulkan system + torch operators
-bash scripts/igpu_vulkan.sh check
-
-# 3) run train.py with safe iGPU Vulkan defaults
-bash scripts/igpu_vulkan.sh train
-```
-
-One-command path:
-
-```bash
-bash scripts/igpu_vulkan.sh quickstart
-```
-
-### Vulkan workflow (optional build)
-
-If your system PyTorch lacks Vulkan support and you want iGPU acceleration:
-
-```bash
-# optional once: install build deps (Ubuntu/Debian)
-sudo apt-get update
-sudo apt-get install -y build-essential git cmake ninja-build python3-dev python3-venv libvulkan-dev vulkan-tools
-
-# build and install torch with USE_VULKAN=1 into .venv-vulkan
-bash scripts/build_pytorch_vulkan.sh
-```
-
-Then verify and use:
-
-```bash
-source .venv-vulkan/bin/activate
-python scripts/verify_vulkan_torch.py
-bash scripts/igpu_vulkan.sh train
-```
-
-Reuse the prebuilt wheel later (no rebuild needed):
-
-```bash
-bash scripts/install_pytorch_vulkan_wheel.sh
-```
-
-**Notes:**
-
-- `verify_vulkan_torch.py` checks real tensor/operator support, not just device availability.
-- `igpu_vulkan.sh setup` prefers `dist/torch-*.whl`; set `AUTO_BUILD_IF_MISSING=1` to auto-build.
-- `scripts/run_vulkan.sh` now delegates to `scripts/igpu_vulkan.sh train`.
-- If Vulkan still fails, fall back to CPU: `AUTORESEARCH_DEVICE=cpu bash scripts/run_igpu.sh`.
-- Data cap is always enforced: `uv run prepare.py --max-data-gb 10`.
 
 ## Running the agent
 
@@ -133,16 +66,7 @@ pyproject.toml  — dependencies
 
 ## Platform support
 
-`train.py` now supports device autodetection and fallback:
-
-- CUDA (with Flash Attention if available, SDPA fallback otherwise)
-- Vulkan (if your local PyTorch build is linked with Vulkan device support)
-- CPU (always available, lowest common denominator path)
-
-Notes:
-
-- Vulkan support depends on your PyTorch build, not just your system Vulkan driver.
-- `prepare.py` now enforces a strict dataset cap via `--max-data-gb` (default: `10`).
+This code currently requires that you have a single NVIDIA GPU. In principle it is quite possible to support CPU, MPS and other platforms but this would also bloat the code. I'm not 100% sure that I want to take this on personally right now. People can reference (or have their agents reference) the full/parent nanochat repository that has wider platform support and shows the various solutions (e.g. a Flash Attention 3 kernels fallback implementation, generic device support, autodetection, etc.), feel free to create forks or discussions for other platforms and I'm happy to link to them here in the README in some new notable forks section or etc.
 
 Seeing as there seems to be a lot of interest in tinkering with autoresearch on much smaller compute platforms than an H100, a few extra words. If you're going to try running autoresearch on smaller computers (Macbooks etc.), I'd recommend one of the forks below. On top of this, here are some recommendations for how to tune the defaults for much smaller models for aspiring forks:
 
