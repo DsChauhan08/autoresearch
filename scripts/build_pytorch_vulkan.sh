@@ -17,6 +17,7 @@ set -euo pipefail
 #   CLEAN_BUILD=1
 #   EXPORT_WHEEL_DIR=dist
 #   INSTALL_APT_DEPS=1
+#   INSTALL_RUNTIME_DEPS=1
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK_DIR="${WORK_DIR:-${ROOT_DIR}/.cache/pytorch-vulkan-src}"
@@ -28,6 +29,7 @@ CLONE_DEPTH="${CLONE_DEPTH:-1}"
 CLEAN_BUILD="${CLEAN_BUILD:-1}"
 EXPORT_WHEEL_DIR="${EXPORT_WHEEL_DIR:-${ROOT_DIR}/dist}"
 INSTALL_APT_DEPS="${INSTALL_APT_DEPS:-0}"
+INSTALL_RUNTIME_DEPS="${INSTALL_RUNTIME_DEPS:-1}"
 
 if [[ "${PYTHON_BIN}" == "python3" ]] && command -v python3.11 >/dev/null 2>&1; then
   # PyTorch source builds are currently more reliable on 3.11 than bleeding-edge interpreters.
@@ -125,6 +127,9 @@ cp -f "${WHEEL_PATH}" "${EXPORTED_WHEEL}"
 echo "[vulkan-build] Prebuilt wheel exported to ${EXPORTED_WHEEL}"
 echo "[vulkan-build] Installing ${EXPORTED_WHEEL}"
 python -m pip install --force-reinstall "${EXPORTED_WHEEL}"
+if [[ "${INSTALL_RUNTIME_DEPS}" == "1" ]]; then
+  PYTHON_BIN=python bash "${ROOT_DIR}/scripts/install_autoresearch_runtime_deps.sh"
+fi
 
 echo "[vulkan-build] Verifying Vulkan build..."
 python "${ROOT_DIR}/scripts/verify_vulkan_torch.py"
@@ -134,4 +139,4 @@ echo "[vulkan-build] Success."
 echo "Activate this environment with:"
 echo "  source ${VENV_PATH}/bin/activate"
 echo "Then run autoresearch with:"
-echo "  AUTORESEARCH_DEVICE=vulkan uv run train.py"
+echo "  bash scripts/igpu_vulkan.sh train"

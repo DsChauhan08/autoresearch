@@ -10,11 +10,13 @@ set -euo pipefail
 #   VENV_PATH=.venv-vulkan
 #   PYTHON_BIN=python3.11
 #   WHEEL_PATH=dist/torch-*.whl
+#   INSTALL_RUNTIME_DEPS=1
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_PATH="${VENV_PATH:-${ROOT_DIR}/.venv-vulkan}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 WHEEL_PATH="${WHEEL_PATH:-}"
+INSTALL_RUNTIME_DEPS="${INSTALL_RUNTIME_DEPS:-1}"
 
 if [[ "${PYTHON_BIN}" == "python3" ]] && command -v python3.11 >/dev/null 2>&1; then
   PYTHON_BIN="python3.11"
@@ -48,6 +50,9 @@ echo "[vulkan-wheel] Wheel: ${WHEEL_PATH}"
 source "${VENV_PATH}/bin/activate"
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install --force-reinstall "${WHEEL_PATH}"
+if [[ "${INSTALL_RUNTIME_DEPS}" == "1" ]]; then
+  PYTHON_BIN=python bash "${ROOT_DIR}/scripts/install_autoresearch_runtime_deps.sh"
+fi
 python "${ROOT_DIR}/scripts/verify_vulkan_torch.py"
 
 echo
@@ -55,4 +60,4 @@ echo "[vulkan-wheel] Success."
 echo "Activate with:"
 echo "  source ${VENV_PATH}/bin/activate"
 echo "Then run:"
-echo "  bash scripts/run_vulkan.sh"
+echo "  bash scripts/igpu_vulkan.sh train"

@@ -9,16 +9,18 @@ expose the device type string but still miss key operators.
 import math
 import sys
 
-import torch
-import torch.nn.functional as F
-
-
 def fail(message: str) -> None:
     print(f"[verify-vulkan] FAIL: {message}")
     sys.exit(1)
 
 
 def main() -> None:
+    try:
+        import torch
+        import torch.nn.functional as F
+    except Exception as e:
+        fail(f"importing torch failed: {type(e).__name__}: {e}")
+
     print(f"[verify-vulkan] torch: {torch.__version__}")
 
     try:

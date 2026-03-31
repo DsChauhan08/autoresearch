@@ -40,28 +40,40 @@ uv run train.py
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
 
-### Low-power CPU/iGPU profile
+### iGPU-first path (CPU/low-power devices)
 
-If you want this to stay responsive for other tasks, run with explicit throttling knobs:
+For systems with only integrated GPUs or low-power CPUs, use:
 
 ```bash
-AUTORESEARCH_DEVICE=auto \
-AUTORESEARCH_CPU_THREADS=4 \
-AUTORESEARCH_INTEROP_THREADS=1 \
-AUTORESEARCH_TOKENIZER_THREADS=2 \
-AUTORESEARCH_NICE=12 \
-AUTORESEARCH_COMPILE=0 \
-AUTORESEARCH_AMP=0 \
-AUTORESEARCH_USE_MUON=0 \
-uv run train.py
+bash scripts/run_igpu.sh
 ```
 
-`AUTORESEARCH_DEVICE=auto` tries CUDA, then Vulkan, then CPU.  
-Use `AUTORESEARCH_DEVICE=vulkan` to force Vulkan (fails fast if unsupported by your PyTorch build).
+This keeps host load low and uses `AUTORESEARCH_DEVICE=auto` (tries CUDA → Vulkan → CPU).
 
-### Vulkan workflow (build + run)
+### Vulkan iGPU quick entrypoint (recommended)
 
-If your distro PyTorch/uv environment does not include Vulkan operators, build a local Vulkan-enabled PyTorch wheel:
+If you want a frictionless Vulkan-specific flow on Linux:
+
+```bash
+# 1) setup Vulkan torch in .venv-vulkan (from dist wheel when available)
+bash scripts/igpu_vulkan.sh setup
+
+# 2) check Vulkan system + torch operators
+bash scripts/igpu_vulkan.sh check
+
+# 3) run train.py with safe iGPU Vulkan defaults
+bash scripts/igpu_vulkan.sh train
+```
+
+One-command path:
+
+```bash
+bash scripts/igpu_vulkan.sh quickstart
+```
+
+### Vulkan workflow (optional build)
+
+If your system PyTorch lacks Vulkan support and you want iGPU acceleration:
 
 ```bash
 # optional once: install build deps (Ubuntu/Debian)
@@ -72,26 +84,27 @@ sudo apt-get install -y build-essential git cmake ninja-build python3-dev python
 bash scripts/build_pytorch_vulkan.sh
 ```
 
-Then verify and run:
+Then verify and use:
 
 ```bash
 source .venv-vulkan/bin/activate
 python scripts/verify_vulkan_torch.py
-bash scripts/run_vulkan.sh
+bash scripts/igpu_vulkan.sh train
 ```
 
-Reinstall later from the exported prebuilt wheel (no rebuild needed):
+Reuse the prebuilt wheel later (no rebuild needed):
 
 ```bash
 bash scripts/install_pytorch_vulkan_wheel.sh
 ```
 
-Notes:
+**Notes:**
 
-- `scripts/verify_vulkan_torch.py` checks real tensor/operator behavior, not just `torch.device("vulkan")`.
-- `scripts/build_pytorch_vulkan.sh` exports the built wheel into `dist/` for reuse.
-- If Vulkan still fails, run in CPU mode (`AUTORESEARCH_DEVICE=cpu`) while keeping the low-power thread limits.
-- Keep using `uv run prepare.py --max-data-gb 10` to preserve the 10 GiB data cap.
+- `verify_vulkan_torch.py` checks real tensor/operator support, not just device availability.
+- `igpu_vulkan.sh setup` prefers `dist/torch-*.whl`; set `AUTO_BUILD_IF_MISSING=1` to auto-build.
+- `scripts/run_vulkan.sh` now delegates to `scripts/igpu_vulkan.sh train`.
+- If Vulkan still fails, fall back to CPU: `AUTORESEARCH_DEVICE=cpu bash scripts/run_igpu.sh`.
+- Data cap is always enforced: `uv run prepare.py --max-data-gb 10`.
 
 ## Running the agent
 

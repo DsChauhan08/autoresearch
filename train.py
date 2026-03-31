@@ -201,6 +201,12 @@ def pick_attention_backend(device):
 def synchronize_device(device):
     if device.type == "cuda":
         torch.cuda.synchronize()
+        return
+    if device.type == "vulkan":
+        vulkan_module = getattr(torch, "vulkan", None)
+        synchronize = getattr(vulkan_module, "synchronize", None) if vulkan_module is not None else None
+        if callable(synchronize):
+            synchronize()
 
 
 def max_memory_mb(device):
@@ -209,16 +215,84 @@ def max_memory_mb(device):
     return 0.0
 
 
+def _supports_training_dtype(device, dtype):
+    try:
+        x = torch.randn(2, 8, device=device, dtype=dtype, requires_grad=True)
+        w = torch.randn(8, 8, device=device, dtype=dtype, requires_grad=True)
+        y = (x @ w).pow(2).mean()
+        y.backward()
+    except Exception as e:
+        return False, e
+    return True, None
+
+
+def _supports_amp_autocast(device, dtype):
+    try:
+        with torch.amp.autocast(device_type=device.type, dtype=dtype):
+            x = torch.randn(2, 8, device=device)
+            w = torch.randn(8, 8, device=device)
+            _ = (x @ w).pow(2).mean()
+    except Exception as e:
+        return False, e
+    return True, None
+
+
+def resolve_runtime_toggles(device):
+    enable_compile = _env_flag("AUTORESEARCH_COMPILE", device.type == "cuda")
+    use_amp = _env_flag("AUTORESEARCH_AMP", device.type == "cuda")
+    use_muon = _env_flag("AUTORESEARCH_USE_MUON", device.type == "cuda")
+
+    if enable_compile and device.type != "cuda":
+        print(f"Disabling torch.compile on {device.type}: compile path is CUDA-first in this script.")
+        enable_compile = False
+    if use_amp and device.type != "cuda":
+        print(f"Disabling AMP on {device.type}: autocast support is not reliable on this backend.")
+        use_amp = False
+    if use_muon and device.type != "cuda":
+        print(f"Disabling Muon optimizer groups on {device.type}: using AdamW matrix groups instead.")
+        use_muon = False
+
+    return enable_compile, use_amp, use_muon
+
+
+def make_autocast_context(device, model_dtype, use_amp):
+    if not use_amp:
+        return contextlib.nullcontext(), False
+    autocast_dtype = torch.bfloat16 if model_dtype == torch.bfloat16 else torch.float32
+    supported, error = _supports_amp_autocast(device, autocast_dtype)
+    if not supported:
+        print(
+            f"Disabling AMP on {device.type}: autocast probe failed ({_format_error(error)}); "
+            "continuing in fp32."
+        )
+        return contextlib.nullcontext(), False
+    return torch.amp.autocast(device_type=device.type, dtype=autocast_dtype), True
+
+
 def pick_model_dtype(device, preference):
     pref = preference.lower()
     if pref not in {"auto", "float32", "bfloat16"}:
         raise ValueError(f"Invalid AUTORESEARCH_DTYPE={preference!r}; expected auto/float32/bfloat16")
     if pref == "float32":
         return torch.float32
-    if pref == "bfloat16":
-        return torch.bfloat16
-    if device.type == "cuda":
-        return torch.bfloat16
+    if pref == "auto":
+        desired_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    else:
+        desired_dtype = torch.bfloat16
+    if desired_dtype == torch.float32:
+        return desired_dtype
+    supported, error = _supports_training_dtype(device, desired_dtype)
+    if supported:
+        return desired_dtype
+    reason = (
+        "AUTORESEARCH_DTYPE=bfloat16 requested"
+        if pref == "bfloat16"
+        else "automatic bfloat16 selection"
+    )
+    print(
+        f"Model dtype fallback: {reason} is not usable on {device.type} "
+        f"({_format_error(error)}); using torch.float32."
+    )
     return torch.float32
 
 
@@ -763,10 +837,7 @@ ATTN_BACKEND = pick_attention_backend(device)
 print(f"Attention backend: {ATTN_BACKEND}")
 clamp_hyperparams_for_device(device)
 
-enable_compile_default = device.type == "cuda"
-ENABLE_COMPILE = _env_flag("AUTORESEARCH_COMPILE", enable_compile_default)
-USE_AMP = _env_flag("AUTORESEARCH_AMP", device.type == "cuda")
-USE_MUON = _env_flag("AUTORESEARCH_USE_MUON", device.type == "cuda")
+ENABLE_COMPILE, USE_AMP, USE_MUON = resolve_runtime_toggles(device)
 print(f"Torch compile: {ENABLE_COMPILE}")
 print(f"Autocast AMP: {USE_AMP}")
 print(f"Muon optimizer groups: {USE_MUON}")
@@ -774,11 +845,7 @@ print(f"Muon optimizer groups: {USE_MUON}")
 if device.type == "cuda":
     torch.set_float32_matmul_precision("high")
 
-if USE_AMP:
-    autocast_dtype = torch.bfloat16 if MODEL_DTYPE == torch.bfloat16 else torch.float32
-    autocast_ctx = torch.amp.autocast(device_type=device.type, dtype=autocast_dtype)
-else:
-    autocast_ctx = contextlib.nullcontext()
+autocast_ctx, USE_AMP = make_autocast_context(device, MODEL_DTYPE, USE_AMP)
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -826,7 +893,45 @@ optimizer = model.setup_optimizer(
 )
 
 if ENABLE_COMPILE:
-    model = torch.compile(model, dynamic=False)
+    try:
+        model = torch.compile(model, dynamic=False)
+    except Exception as e:
+        print(
+            f"Torch compile disabled (setup failed on {device.type}; continuing eager): "
+            f"{_format_error(e)}"
+        )
+        ENABLE_COMPILE = False
+
+eager_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+def run_with_runtime_fallback(fn):
+    global model, ENABLE_COMPILE, USE_AMP, autocast_ctx
+    while True:
+        try:
+            with autocast_ctx:
+                return fn()
+        except Exception as e:
+            if ENABLE_COMPILE and model is not eager_model:
+                print(
+                    f"Torch compile disabled (runtime failed on {device.type}; falling back to eager): "
+                    f"{_format_error(e)}"
+                )
+                model = eager_model
+                ENABLE_COMPILE = False
+                continue
+            if USE_AMP:
+                print(
+                    f"Autocast AMP disabled (runtime failed on {device.type}; retrying in fp32): "
+                    f"{_format_error(e)}"
+                )
+                USE_AMP = False
+                autocast_ctx = contextlib.nullcontext()
+                continue
+            raise
+
+# Print final effective settings after setup
+print(f"Final settings - Torch compile: {ENABLE_COMPILE}, Autocast AMP: {USE_AMP}")
 
 train_loader = make_dataloader(
     tokenizer,
@@ -872,8 +977,7 @@ while True:
     synchronize_device(device)
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss = model(x, y)
+        loss = run_with_runtime_fallback(lambda: model(x, y))
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
@@ -944,14 +1048,15 @@ total_tokens = step * TOTAL_BATCH_SIZE
 
 # Final eval
 model.eval()
-with autocast_ctx:
-    val_bpb = evaluate_bpb(
+val_bpb = run_with_runtime_fallback(
+    lambda: evaluate_bpb(
         model,
         tokenizer,
         DEVICE_BATCH_SIZE,
         device=device,
         tokenizer_threads=tokenizer_threads,
     )
+)
 
 # Final summary
 t_end = time.time()
