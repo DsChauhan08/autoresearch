@@ -20,7 +20,8 @@ If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/s
 
 ## Quick start
 
-**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
+**Requirements:** Python 3.10+ and [uv](https://docs.astral.sh/uv/).
+The default flow is CPU/iGPU-safe and does **not** require Vulkan or CUDA to be installed.
 
 ```bash
 
@@ -31,13 +32,172 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 
 # 3. Download data and train tokenizer (one-time, ~2 min)
-uv run prepare.py
+bash scripts/run_igpu.sh prepare
 
 # 4. Manually run a single training experiment (~5 min)
-uv run train.py
+bash scripts/run_igpu.sh train
 ```
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
+
+## Runtime paths
+
+### Default path (CPU/iGPU-safe)
+```bash
+bash scripts/run_igpu.sh prepare
+bash scripts/run_igpu.sh train
+```
+
+### Optional Vulkan path (explicit opt-in)
+```bash
+# optional: install Python build helpers for source-build workflows
+uv sync --extra vulkan-build
+
+bash scripts/run_vulkan.sh prepare
+bash scripts/igpu_vulkan.sh setup
+bash scripts/igpu_vulkan.sh check
+bash scripts/igpu_vulkan.sh train
+```
+
+`scripts/run_vulkan.sh` supports `prepare` and otherwise delegates to `scripts/igpu_vulkan.sh`.
+
+Vulkan training readiness is now stricter than just `torch.device("vulkan")`: startup probes include
+tensor allocation + a tiny forward/backward training smoke test before selecting Vulkan.
+
+PyTorch's official Vulkan workflow is build-from-source oriented. This repo mirrors that
+workflow by expecting a Vulkan-enabled wheel built with `USE_VULKAN=1` and (by default)
+`USE_VULKAN_SHADERC_RUNTIME=1`, `USE_VULKAN_WRAPPER=0`.
+
+Important compatibility note: third-party forks such as
+`ixu2486/pytorch_retryix_backend` currently publish Windows-only wheels (`win_amd64`)
+and are not directly installable on this Linux setup. For Linux iGPU Vulkan training,
+use the repo's supported path: build/install a Linux Vulkan-enabled PyTorch wheel via
+`scripts/build_pytorch_vulkan.sh` or install one through `scripts/igpu_vulkan.sh setup`.
+
+### Optional manual device override for training
+```bash
+bash scripts/run_igpu.sh train                         # default: AUTORESEARCH_DEVICE=auto
+AUTORESEARCH_DEVICE=cpu bash scripts/run_igpu.sh train
+AUTORESEARCH_DEVICE=cuda bash scripts/run_igpu.sh train
+AUTORESEARCH_DEVICE=vulkan bash scripts/run_igpu.sh train
+```
+
+### Optional low-memory overrides (CPU/iGPU)
+```bash
+AUTORESEARCH_DEPTH=2 \
+AUTORESEARCH_DEVICE_BATCH_SIZE=4 \
+AUTORESEARCH_TOTAL_BATCH_SIZE=8192 \
+bash scripts/run_igpu.sh train
+```
+
+### RAM budget control (new)
+By default, `run_igpu.sh` sets `AUTORESEARCH_RAM_FRACTION=0.50`, so training shape auto-scales to about 50% of total system RAM.
+
+```bash
+# default behavior: ~50% RAM target
+bash scripts/run_igpu.sh train
+
+# explicit fraction (5%..95%)
+AUTORESEARCH_RAM_FRACTION=0.60 bash scripts/run_igpu.sh train
+
+# explicit absolute cap in MB (overrides fraction)
+AUTORESEARCH_RAM_MB=6144 bash scripts/run_igpu.sh train
+
+# optional full override (must be divisible by DEVICE_BATCH_SIZE * MAX_SEQ_LEN)
+AUTORESEARCH_TOTAL_BATCH_SIZE=8192 AUTORESEARCH_DEVICE_BATCH_SIZE=4 bash scripts/run_igpu.sh train
+```
+
+## CPU-only validation and what "working" means
+
+For CPU-only laptops, success means:
+
+1. `prepare.py` completes (data + tokenizer created),
+2. training starts and continues without backend/device crashes,
+3. loss trends downward during the run,
+4. the run reaches the time-budget stop condition and enters final evaluation.
+
+On this machine, CPU mode was validated with:
+
+```bash
+AUTORESEARCH_DEVICE=cpu \
+AUTORESEARCH_RAM_FRACTION=0.50 \
+AUTORESEARCH_USE_MUON=0 \
+AUTORESEARCH_AMP=0 \
+AUTORESEARCH_COMPILE=0 \
+AUTORESEARCH_TOKENIZER_THREADS=1 \
+uv run train.py
+```
+
+Observed runtime diagnostics:
+
+- `Selected: cpu (explicit cpu request)`
+- `Training shape: depth=3, device_batch_size=6, total_batch_size=24576`
+- `RAM budget: 6.7 GiB (AUTORESEARCH_RAM_FRACTION=0.500)`
+- training progressed through the full 5-minute budget (`remaining` reached `0s`)
+- train loss decreased steadily (example: `9.01 -> 7.31` during the same run)
+
+Note: CPU runs are functionally valid but slower than CUDA. The research loop is the same; throughput is lower.
+
+## Autopilot on CPU/iGPU (detailed runbook)
+
+`autoresearch` autopilot is an agent loop (edit `train.py` -> run -> evaluate -> keep/discard), not just a single training command.
+
+### 1) One-time setup
+
+```bash
+uv sync
+bash scripts/run_igpu.sh prepare
+```
+
+### 2) Stable CPU runtime defaults
+
+Use these for unattended CPU runs:
+
+```bash
+export AUTORESEARCH_DEVICE=cpu
+export AUTORESEARCH_RAM_FRACTION=0.50
+export AUTORESEARCH_USE_MUON=0
+export AUTORESEARCH_AMP=0
+export AUTORESEARCH_COMPILE=0
+export AUTORESEARCH_TOKENIZER_THREADS=1
+```
+
+### 3) Start autonomous experimentation
+
+Point your coding agent at `program.md` and let it run continuously. The default loop in `program.md` already does:
+
+- modify `train.py`
+- run `uv run train.py`
+- read `val_bpb`
+- keep/discard changes
+- repeat indefinitely
+
+### 4) Run in a persistent terminal session
+
+Use `tmux`/`screen` so the loop survives terminal disconnects:
+
+```bash
+tmux new -s autoresearch
+# start your agent in this repo, then detach with Ctrl-b d
+```
+
+### 5) Monitor health
+
+During long runs, periodically check:
+
+- no repeated Python tracebacks in logs,
+- loss remains finite (no NaN/INF),
+- `val_bpb` is still being produced,
+- system memory pressure is acceptable (reduce RAM fraction if needed).
+
+### 6) If you hit memory pressure
+
+Lower one or more of:
+
+- `AUTORESEARCH_RAM_FRACTION` (e.g. `0.35`)
+- `AUTORESEARCH_DEPTH`
+- `AUTORESEARCH_DEVICE_BATCH_SIZE`
+- `AUTORESEARCH_TOTAL_BATCH_SIZE` (must be divisible by `DEVICE_BATCH_SIZE * MAX_SEQ_LEN`)
 
 ## Running the agent
 
@@ -66,19 +226,17 @@ pyproject.toml  — dependencies
 
 ## Platform support
 
-This code currently requires that you have a single NVIDIA GPU. In principle it is quite possible to support CPU, MPS and other platforms but this would also bloat the code. I'm not 100% sure that I want to take this on personally right now. People can reference (or have their agents reference) the full/parent nanochat repository that has wider platform support and shows the various solutions (e.g. a Flash Attention 3 kernels fallback implementation, generic device support, autodetection, etc.), feel free to create forks or discussions for other platforms and I'm happy to link to them here in the README in some new notable forks section or etc.
+The project supports NVIDIA CUDA, Intel/AMD Vulkan, and CPU backends. By default, the system auto-detects your device and falls back gracefully.
 
-Seeing as there seems to be a lot of interest in tinkering with autoresearch on much smaller compute platforms than an H100, a few extra words. If you're going to try running autoresearch on smaller computers (Macbooks etc.), I'd recommend one of the forks below. On top of this, here are some recommendations for how to tune the defaults for much smaller models for aspiring forks:
+**For smaller compute platforms** (Macbooks, laptops, etc.), here are tuning recommendations:
 
-1. To get half-decent results I'd use a dataset with a lot less entropy, e.g. this [TinyStories dataset](https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean). These are GPT-4 generated short stories. Because the data is a lot narrower in scope, you will see reasonable results with a lot smaller models (if you try to sample from them after training).
-2. You might experiment with decreasing `vocab_size`, e.g. from 8192 down to 4096, 2048, 1024, or even - simply byte-level tokenizer with 256 possibly bytes after utf-8 encoding.
-3. In `prepare.py`, you'll want to lower `MAX_SEQ_LEN` a lot, depending on the computer even down to 256 etc. As you lower `MAX_SEQ_LEN`, you may want to experiment with increasing `DEVICE_BATCH_SIZE` in `train.py` slightly to compensate. The number of tokens per fwd/bwd pass is the product of these two.
-4. Also in `prepare.py`, you'll want to decrease `EVAL_TOKENS` so that your validation loss is evaluated on a lot less data.
-5. In `train.py`, the primary single knob that controls model complexity is the `DEPTH` (default 8, here). A lot of variables are just functions of this, so e.g. lower it down to e.g. 4.
-6. You'll want to most likely use `WINDOW_PATTERN` of just "L", because "SSSL" uses alternating banded attention pattern that may be very inefficient for you. Try it.
-7. You'll want to lower `TOTAL_BATCH_SIZE` a lot, but keep it powers of 2, e.g. down to `2**14` (~16K) or so even, hard to tell.
-
-I think these would be the reasonable hyperparameters to play with. Ask your favorite coding agent for help and copy paste them this guide, as well as the full source code.
+1. **Dataset:** Use a dataset with lower entropy, e.g. [TinyStories](https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean). The narrower scope allows smaller models to show reasonable results.
+2. **Vocab size:** Decrease from 8192 to 4096, 2048, 1024, or even 256 (byte-level).
+3. **Sequence length:** In `prepare.py`, lower `MAX_SEQ_LEN` (e.g., down to 256). Adjust `DEVICE_BATCH_SIZE` in `train.py` to compensate.
+4. **Evaluation budget:** In `prepare.py`, decrease `EVAL_TOKENS` to reduce validation data.
+5. **Model depth:** In `train.py`, lower `DEPTH` (default 8) to 4 or lower. Many hyperparameters depend on this.
+6. **Attention pattern:** Use `WINDOW_PATTERN = "L"` instead of "SSSL" for efficiency on smaller devices.
+7. **Batch size:** Lower `TOTAL_BATCH_SIZE` while keeping it a power of 2 (e.g., `2**14` ≈ 16K).
 
 ## Notable forks
 

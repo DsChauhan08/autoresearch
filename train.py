@@ -11,19 +11,372 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 import gc
 import math
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, asdict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
-
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+
+# ---------------------------------------------------------------------------
+# Runtime selection and backend feature flags
+# ---------------------------------------------------------------------------
+
+ALLOWED_DEVICE_HINTS = {"auto", "cuda", "vulkan", "cpu"}
+
+fa3 = None
+_ALLOW_FA3_ATTENTION = False
+_ALLOW_SDPA_ATTENTION = True
+_FA3_FALLBACK_WARNED = False
+_SDPA_FALLBACK_WARNED = False
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    requested_device: str
+    device: torch.device
+    selection_reason: str
+    cuda_probe: str
+    vulkan_probe: str
+    fa3_probe: str
+    fa3_enabled: bool
+    sdpa_enabled: bool
+    amp_enabled: bool
+    compile_enabled: bool
+    muon_enabled: bool
+    tokenizer_threads: int
+    cpu_threads: int
+    interop_threads: int
+    nice_level: int
+
+
+def _parse_env_flag(name, default):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"Invalid {name}={raw!r}. Expected one of: 1,0,true,false,yes,no,on,off"
+    )
+
+
+def _parse_env_int(name, default, min_value=1):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {name}={raw!r}. Expected an integer.") from exc
+    if value < min_value:
+        raise ValueError(f"Invalid {name}={raw!r}. Expected integer >= {min_value}.")
+    return value
+
+
+def _parse_env_float(name, default, min_value=None, max_value=None):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {name}={raw!r}. Expected a number.") from exc
+    if min_value is not None and value < min_value:
+        raise ValueError(f"Invalid {name}={raw!r}. Expected >= {min_value}.")
+    if max_value is not None and value > max_value:
+        raise ValueError(f"Invalid {name}={raw!r}. Expected <= {max_value}.")
+    return value
+
+
+def _get_total_system_memory_bytes():
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return int(pages) * int(page_size)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _resolve_ram_budget():
+    total_ram_bytes = _get_total_system_memory_bytes()
+    budget_source = None
+    budget_bytes = None
+
+    ram_mb_raw = os.getenv("AUTORESEARCH_RAM_MB")
+    if ram_mb_raw is not None and ram_mb_raw.strip():
+        ram_mb = _parse_env_int("AUTORESEARCH_RAM_MB", 0, min_value=256)
+        budget_bytes = ram_mb * 1024 * 1024
+        budget_source = f"AUTORESEARCH_RAM_MB={ram_mb}"
+    else:
+        ram_fraction_raw = os.getenv("AUTORESEARCH_RAM_FRACTION")
+        if ram_fraction_raw is not None and ram_fraction_raw.strip():
+            ram_fraction = _parse_env_float(
+                "AUTORESEARCH_RAM_FRACTION", 0.5, min_value=0.05, max_value=0.95
+            )
+            if total_ram_bytes is None:
+                raise RuntimeError(
+                    "AUTORESEARCH_RAM_FRACTION was set but total system RAM could not be detected."
+                )
+            budget_bytes = int(total_ram_bytes * ram_fraction)
+            budget_source = f"AUTORESEARCH_RAM_FRACTION={ram_fraction:.3f}"
+
+    if budget_bytes is not None:
+        min_budget = 256 * 1024 * 1024
+        budget_bytes = max(budget_bytes, min_budget)
+        if total_ram_bytes is not None:
+            budget_bytes = min(budget_bytes, int(total_ram_bytes * 0.95))
+    return budget_bytes, total_ram_bytes, budget_source
+
+
+def _shape_from_ram_budget_bytes(ram_budget_bytes, device_type):
+    ram_budget_gib = ram_budget_bytes / (1024 ** 3)
+    if device_type == "vulkan":
+        # Vulkan backends on iGPU are usually memory-bandwidth/allocator constrained.
+        if ram_budget_gib < 2:
+            return 2, 1
+        if ram_budget_gib < 4:
+            return 2, 2
+        if ram_budget_gib < 6:
+            return 2, 3
+        if ram_budget_gib < 8:
+            return 3, 3
+        if ram_budget_gib < 12:
+            return 3, 4
+        return 4, 4
+
+    if ram_budget_gib < 2:
+        return 2, 2
+    if ram_budget_gib < 4:
+        return 2, 4
+    if ram_budget_gib < 6:
+        return 3, 4
+    if ram_budget_gib < 8:
+        return 3, 6
+    if ram_budget_gib < 12:
+        return 4, 8
+    return 4, 12
+
+
+def _auto_total_batch_size(tokens_per_fwdbwd, cap_tokens):
+    # Keep at least one micro-step and make total batch divisible by per-step tokens.
+    cap_tokens = max(tokens_per_fwdbwd, cap_tokens)
+    return (cap_tokens // tokens_per_fwdbwd) * tokens_per_fwdbwd
+
+
+def _resolve_time_budget_seconds():
+    return _parse_env_int("AUTORESEARCH_TIME_BUDGET_SECONDS", TIME_BUDGET, min_value=30)
+
+
+def _format_exception(exc):
+    return f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
+
+
+def _probe_cuda():
+    if not torch.cuda.is_available():
+        return False, "unavailable (torch.cuda.is_available() is False)"
+    try:
+        torch.empty(1, device="cuda")
+        capability = torch.cuda.get_device_capability(0)
+        name = torch.cuda.get_device_name(0)
+        return True, f"ready ({name}, cc={capability[0]}.{capability[1]})"
+    except (RuntimeError, AssertionError) as exc:
+        return False, f"unavailable ({_format_exception(exc)})"
+
+
+def _probe_vulkan():
+    if not hasattr(torch, "is_vulkan_available"):
+        return False, "unavailable (torch.is_vulkan_available missing)"
+    try:
+        if not torch.is_vulkan_available():
+            return False, "unavailable (torch.is_vulkan_available() is False)"
+    except (RuntimeError, OSError, AssertionError) as exc:
+        return False, f"unavailable ({_format_exception(exc)})"
+
+    vulkan_backend = getattr(torch.backends, "vulkan", None)
+    if vulkan_backend is None:
+        return False, "unavailable (torch.backends.vulkan missing)"
+    if not hasattr(vulkan_backend, "is_available"):
+        return False, "unavailable (torch.backends.vulkan.is_available missing)"
+    try:
+        if not vulkan_backend.is_available():
+            return False, "unavailable (torch.backends.vulkan.is_available() is False)"
+    except (RuntimeError, OSError) as exc:
+        return False, f"unavailable ({_format_exception(exc)})"
+
+    device = torch.device("vulkan")
+    try:
+        test_tensor = torch.empty(1, device=device)
+        _ = test_tensor + 1
+    except (RuntimeError, NotImplementedError) as exc:
+        return False, f"unavailable ({_format_exception(exc)})"
+
+    try:
+        vocab_size = 128
+        hidden = 64
+        batch_size = 2
+        seq_len = 16
+        tokens = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+        targets = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+        embedding = nn.Embedding(vocab_size, hidden, device=device)
+        projection = nn.Linear(hidden, vocab_size, bias=False, device=device)
+        logits = projection(embedding(tokens))
+        loss = F.cross_entropy(logits.view(-1, vocab_size).float(), targets.view(-1))
+        loss.backward()
+    except (RuntimeError, NotImplementedError, AssertionError) as exc:
+        return False, f"unavailable (training-smoke failed: {_format_exception(exc)})"
+
+    return True, "ready (training-smoke passed)"
+
+
+def _try_init_fa3():
+    try:
+        from kernels import get_kernel
+    except ImportError as exc:
+        return None, f"disabled ({_format_exception(exc)})"
+
+    try:
+        capability = torch.cuda.get_device_capability()
+        repo = "varunneal/flash-attention-3" if capability == (9, 0) else "kernels-community/flash-attn3"
+        return get_kernel(repo).flash_attn_interface, f"enabled ({repo})"
+    except (RuntimeError, OSError, AttributeError, ImportError) as exc:
+        return None, f"disabled ({_format_exception(exc)})"
+
+
+def resolve_runtime():
+    requested_device = os.getenv("AUTORESEARCH_DEVICE", "auto").strip().lower()
+    if requested_device not in ALLOWED_DEVICE_HINTS:
+        allowed = ", ".join(sorted(ALLOWED_DEVICE_HINTS))
+        raise ValueError(
+            f"Invalid AUTORESEARCH_DEVICE={requested_device!r}. Expected one of: {allowed}"
+        )
+
+    cuda_available, cuda_probe = _probe_cuda()
+    vulkan_available, vulkan_probe = _probe_vulkan()
+
+    if requested_device == "auto":
+        if cuda_available:
+            selected_device = "cuda"
+            selection_reason = "auto fallback selected cuda"
+        elif vulkan_available:
+            selected_device = "vulkan"
+            selection_reason = "auto fallback selected vulkan (cuda unavailable)"
+        else:
+            selected_device = "cpu"
+            selection_reason = "auto fallback selected cpu (cuda and vulkan unavailable)"
+    elif requested_device == "cuda":
+        if not cuda_available:
+            raise RuntimeError(f"CUDA requested but unavailable: {cuda_probe}")
+        selected_device = "cuda"
+        selection_reason = "explicit cuda request"
+    elif requested_device == "vulkan":
+        if not vulkan_available:
+            raise RuntimeError(f"Vulkan requested but unavailable: {vulkan_probe}")
+        selected_device = "vulkan"
+        selection_reason = "explicit vulkan request"
+    else:
+        selected_device = "cpu"
+        selection_reason = "explicit cpu request"
+
+    fa3_probe = "disabled (requires CUDA)"
+    fa3_impl = None
+    if selected_device == "cuda":
+        fa3_impl, fa3_probe = _try_init_fa3()
+
+    compile_enabled = _parse_env_flag(
+        "AUTORESEARCH_COMPILE", selected_device == "cuda" and hasattr(torch, "compile")
+    )
+    amp_enabled = _parse_env_flag("AUTORESEARCH_AMP", selected_device == "cuda")
+    muon_enabled = _parse_env_flag("AUTORESEARCH_USE_MUON", selected_device == "cuda")
+    tokenizer_threads = _parse_env_int("AUTORESEARCH_TOKENIZER_THREADS", 8, min_value=1)
+    cpu_threads = _parse_env_int(
+        "AUTORESEARCH_CPU_THREADS", max(1, (os.cpu_count() or 1) // 2), min_value=1
+    )
+    interop_threads = _parse_env_int("AUTORESEARCH_INTEROP_THREADS", 1, min_value=1)
+    nice_level = _parse_env_int("AUTORESEARCH_NICE", 0, min_value=0)
+
+    if selected_device != "cuda" and compile_enabled:
+        raise RuntimeError(
+            "AUTORESEARCH_COMPILE=1 is only supported when AUTORESEARCH_DEVICE resolves to cuda."
+        )
+    if selected_device != "cuda" and amp_enabled:
+        raise RuntimeError(
+            "AUTORESEARCH_AMP=1 is only supported when AUTORESEARCH_DEVICE resolves to cuda."
+        )
+    if selected_device == "vulkan" and muon_enabled:
+        raise RuntimeError(
+            "AUTORESEARCH_USE_MUON=1 is not supported on Vulkan; use AUTORESEARCH_USE_MUON=0."
+        )
+    if selected_device == "cpu" and muon_enabled:
+        raise RuntimeError(
+            "AUTORESEARCH_USE_MUON=1 is not supported on CPU; use AUTORESEARCH_USE_MUON=0."
+        )
+
+    runtime = RuntimeConfig(
+        requested_device=requested_device,
+        device=torch.device(selected_device),
+        selection_reason=selection_reason,
+        cuda_probe=cuda_probe,
+        vulkan_probe=vulkan_probe,
+        fa3_probe=fa3_probe,
+        fa3_enabled=fa3_impl is not None,
+        sdpa_enabled=selected_device in {"cuda", "cpu"},
+        amp_enabled=amp_enabled,
+        compile_enabled=compile_enabled,
+        muon_enabled=muon_enabled,
+        tokenizer_threads=tokenizer_threads,
+        cpu_threads=cpu_threads,
+        interop_threads=interop_threads,
+        nice_level=nice_level,
+    )
+    return runtime, fa3_impl
+
+
+def initialize_attention_runtime(runtime, fa3_impl):
+    global fa3, _ALLOW_FA3_ATTENTION, _ALLOW_SDPA_ATTENTION
+    global _FA3_FALLBACK_WARNED, _SDPA_FALLBACK_WARNED
+    fa3 = fa3_impl
+    _ALLOW_FA3_ATTENTION = runtime.fa3_enabled
+    _ALLOW_SDPA_ATTENTION = runtime.sdpa_enabled
+    _FA3_FALLBACK_WARNED = False
+    _SDPA_FALLBACK_WARNED = False
+
+
+def log_runtime(runtime):
+    print("Runtime diagnostics:")
+    print(f"  AUTORESEARCH_DEVICE: {runtime.requested_device}")
+    print(f"  CUDA probe:   {runtime.cuda_probe}")
+    print(f"  Vulkan probe: {runtime.vulkan_probe}")
+    print(f"  Selected:     {runtime.device} ({runtime.selection_reason})")
+    print(
+        "  Features: "
+        f"fa3={runtime.fa3_enabled} ({runtime.fa3_probe}), "
+        f"sdpa={runtime.sdpa_enabled}, "
+        f"amp={runtime.amp_enabled}, "
+        f"compile={runtime.compile_enabled}, "
+        f"muon={runtime.muon_enabled}"
+    )
+    print(
+        "  Host: "
+        f"torch_threads={runtime.cpu_threads}, "
+        f"interop_threads={runtime.interop_threads}, "
+        f"tokenizer_threads={runtime.tokenizer_threads}, "
+        f"nice={runtime.nice_level}"
+    )
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -44,6 +397,89 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
+def _build_attention_invalid_mask(seq_len, window_size, device):
+    row = torch.arange(seq_len, device=device).view(seq_len, 1)
+    col = torch.arange(seq_len, device=device).view(1, seq_len)
+    invalid = col > row  # causal
+
+    left_window = None
+    if isinstance(window_size, (tuple, list)) and len(window_size) > 0:
+        left_window = window_size[0]
+    elif isinstance(window_size, int):
+        left_window = window_size
+
+    if isinstance(left_window, int) and left_window >= 0:
+        invalid = invalid | (col < (row - left_window))
+    return invalid
+
+
+def _attention_forward(q, k, v, window_size):
+    """
+    Compute causal attention with fallback chain: FA3 -> SDPA -> manual.
+    q, k, v: (B, T, n_head/n_kv_head, head_dim) - already has rotary applied & normalized
+    window_size: window_size for windowed attention
+    """
+    global _ALLOW_FA3_ATTENTION, _ALLOW_SDPA_ATTENTION
+    global _FA3_FALLBACK_WARNED, _SDPA_FALLBACK_WARNED
+
+    # Handle grouped-query attention in fallback kernels.
+    if q.size(2) != k.size(2):
+        if q.size(2) % k.size(2) != 0:
+            raise RuntimeError(
+                f"Incompatible q/k head counts for fallback attention: q={q.size(2)}, k={k.size(2)}"
+            )
+        repeat_factor = q.size(2) // k.size(2)
+        k = k.repeat_interleave(repeat_factor, dim=2)
+        v = v.repeat_interleave(repeat_factor, dim=2)
+
+    # Try FA3 (CUDA only)
+    if _ALLOW_FA3_ATTENTION and fa3 is not None:
+        try:
+            return fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        except (RuntimeError, NotImplementedError, AssertionError) as exc:
+            _ALLOW_FA3_ATTENTION = False
+            if not _FA3_FALLBACK_WARNED:
+                print(f"WARNING: disabling FA3 attention fallback: {_format_exception(exc)}")
+                _FA3_FALLBACK_WARNED = True
+
+    # Try scaled_dot_product_attention (SDPA) - supports CUDA, CPU, and others
+    if _ALLOW_SDPA_ATTENTION:
+        B, T, n_head, head_dim = q.shape
+        q_sdpa = q.transpose(1, 2)
+        k_sdpa = k.transpose(1, 2)
+        v_sdpa = v.transpose(1, 2)
+        invalid = _build_attention_invalid_mask(T, window_size, q.device)
+        attn_mask = torch.zeros((T, T), dtype=q.dtype, device=q.device)
+        attn_mask.masked_fill_(invalid, float("-inf"))
+        try:
+            y = F.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+            )
+            return y.transpose(1, 2)
+        except (RuntimeError, NotImplementedError, AssertionError) as exc:
+            _ALLOW_SDPA_ATTENTION = False
+            if not _SDPA_FALLBACK_WARNED:
+                print(f"WARNING: disabling SDPA attention fallback: {_format_exception(exc)}")
+                _SDPA_FALLBACK_WARNED = True
+
+    # Fallback: manual causal attention (always works)
+    B, T, n_head, head_dim = q.shape
+    scale = 1.0 / math.sqrt(head_dim)
+
+    q_flat = q.transpose(1, 2)
+    k_flat = k.transpose(1, 2)
+    v_flat = v.transpose(1, 2)
+
+    scores = torch.matmul(q_flat, k_flat.transpose(-2, -1)) * scale  # (B, n_head, T, T)
+
+    invalid = _build_attention_invalid_mask(T, window_size, q.device)
+    scores = scores.masked_fill(invalid, float("-inf"))
+
+    attn_weights = F.softmax(scores, dim=-1)
+    y = torch.matmul(attn_weights, v_flat)
+    return y.transpose(1, 2)
+
+
 def has_ve(layer_idx, n_layer):
     """Returns True if layer should have Value Embedding (alternating, last always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
@@ -51,6 +487,8 @@ def has_ve(layer_idx, n_layer):
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4
+    cos = cos.to(dtype=x.dtype)
+    sin = sin.to(dtype=x.dtype)
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
     y1 = x1 * cos + x2 * sin
@@ -90,7 +528,8 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        # Attention backend fallback chain: FA3 -> SDPA -> manual causal attention
+        y = _attention_forward(q, k, v, window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -175,10 +614,6 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
-        for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
@@ -188,7 +623,8 @@ class GPT(nn.Module):
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16()
+        dtype = self.transformer.wte.weight.dtype
+        cos, sin = cos.to(dtype=dtype), sin.to(dtype=dtype)
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         return cos, sin
 
@@ -234,7 +670,8 @@ class GPT(nn.Module):
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5,
+                        muon_enabled=True):
         model_dim = self.config.n_embd
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
@@ -254,11 +691,18 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
+        if muon_enabled:
+            for shape in sorted({p.shape for p in matrix_params}):
+                group_params = [p for p in matrix_params if p.shape == shape]
+                param_groups.append(dict(
+                    kind='muon', params=group_params, lr=matrix_lr,
+                    momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+                ))
+        else:
+            print("Muon disabled for this backend; falling back to AdamW for matrix parameters.")
             param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+                kind='adamw', params=matrix_params, lr=matrix_lr,
+                betas=adam_betas, eps=1e-10, weight_decay=weight_decay,
             ))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
@@ -302,7 +746,6 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
@@ -313,7 +756,6 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
@@ -369,7 +811,7 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-
+        
     def _step_adamw(self, group):
         for p in group['params']:
             if p.grad is None:
@@ -435,7 +877,7 @@ HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
+TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step on CUDA
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
@@ -448,7 +890,53 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 128  # per-device batch size on CUDA
+
+
+def resolve_training_shape(runtime):
+    total_batch_size_explicit = os.getenv("AUTORESEARCH_TOTAL_BATCH_SIZE")
+
+    if runtime.device.type == "cuda":
+        default_depth = DEPTH
+        default_device_batch_size = DEVICE_BATCH_SIZE
+        default_total_batch_size_cap = TOTAL_BATCH_SIZE
+    elif runtime.device.type == "vulkan":
+        # More conservative defaults than CPU because Vulkan iGPU allocators are sensitive.
+        default_depth = min(DEPTH, 3)
+        default_device_batch_size = min(DEVICE_BATCH_SIZE, 4)
+        default_total_batch_size_cap = min(TOTAL_BATCH_SIZE, 2**14)
+    else:
+        # Conservative defaults for CPU to avoid OOM on smaller machines.
+        default_depth = min(DEPTH, 4)
+        default_device_batch_size = min(DEVICE_BATCH_SIZE, 16)
+        default_total_batch_size_cap = min(TOTAL_BATCH_SIZE, 2**15)
+
+    ram_budget_bytes, total_ram_bytes, budget_source = _resolve_ram_budget()
+    if ram_budget_bytes is not None:
+        ram_depth, ram_device_batch_size = _shape_from_ram_budget_bytes(
+            ram_budget_bytes, runtime.device.type
+        )
+        default_depth = min(default_depth, ram_depth)
+        default_device_batch_size = min(default_device_batch_size, ram_device_batch_size)
+
+    depth = _parse_env_int("AUTORESEARCH_DEPTH", default_depth, min_value=1)
+    device_batch_size = _parse_env_int(
+        "AUTORESEARCH_DEVICE_BATCH_SIZE", default_device_batch_size, min_value=1
+    )
+    tokens_per_fwdbwd = device_batch_size * MAX_SEQ_LEN
+    if total_batch_size_explicit is None:
+        total_batch_size = _auto_total_batch_size(tokens_per_fwdbwd, default_total_batch_size_cap)
+    else:
+        total_batch_size = _parse_env_int(
+            "AUTORESEARCH_TOTAL_BATCH_SIZE", default_total_batch_size_cap, min_value=1
+        )
+    if total_batch_size % tokens_per_fwdbwd != 0:
+        raise ValueError(
+            "AUTORESEARCH_TOTAL_BATCH_SIZE must be divisible by "
+            f"AUTORESEARCH_DEVICE_BATCH_SIZE * MAX_SEQ_LEN ({tokens_per_fwdbwd}). "
+            f"Got {total_batch_size}."
+        )
+    return depth, device_batch_size, total_batch_size, ram_budget_bytes, total_ram_bytes, budget_source
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -456,10 +944,50 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 t_start = time.time()
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
+if hasattr(torch, "vulkan") and hasattr(torch.vulkan, "manual_seed_all"):
+    torch.vulkan.manual_seed_all(42)
 torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+# Device and backend selection
+runtime, fa3_impl = resolve_runtime()
+initialize_attention_runtime(runtime, fa3_impl)
+device = runtime.device
+time_budget_seconds = _resolve_time_budget_seconds()
+
+torch.set_num_threads(runtime.cpu_threads)
+try:
+    torch.set_num_interop_threads(runtime.interop_threads)
+except RuntimeError as exc:
+    print(f"Warning: could not set torch interop threads to {runtime.interop_threads}: {exc}")
+if runtime.nice_level > 0:
+    try:
+        os.nice(runtime.nice_level)
+    except OSError as exc:
+        print(f"Warning: unable to increase niceness by {runtime.nice_level}: {exc}")
+
+log_runtime(runtime)
+depth, device_batch_size, total_batch_size, ram_budget_bytes, total_ram_bytes, budget_source = resolve_training_shape(runtime)
+print(
+    "Training shape: "
+    f"depth={depth}, device_batch_size={device_batch_size}, total_batch_size={total_batch_size}"
+)
+if total_ram_bytes is not None:
+    print(f"System RAM: {total_ram_bytes / (1024 ** 3):.1f} GiB")
+if ram_budget_bytes is not None:
+    print(
+        "RAM budget: "
+        f"{ram_budget_bytes / (1024 ** 3):.1f} GiB"
+        + (f" ({budget_source})" if budget_source else "")
+    )
+
+# Setup autocast context
+if runtime.amp_enabled:
+    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+else:
+    autocast_ctx = nullcontext()
+
 H100_BF16_PEAK_FLOPS = 989.5e12
 
 tokenizer = Tokenizer.from_directory()
@@ -476,7 +1004,7 @@ def build_model_config(depth):
         window_pattern=WINDOW_PATTERN,
     )
 
-config = build_model_config(DEPTH)
+config = build_model_config(depth)
 print(f"Model config: {asdict(config)}")
 
 with torch.device("meta"):
@@ -492,9 +1020,8 @@ num_params = param_counts['total']
 num_flops_per_token = model.estimate_flops()
 print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+tokens_per_fwdbwd = device_batch_size * MAX_SEQ_LEN
+grad_accum_steps = total_batch_size // tokens_per_fwdbwd
 
 optimizer = model.setup_optimizer(
     unembedding_lr=UNEMBEDDING_LR,
@@ -503,17 +1030,26 @@ optimizer = model.setup_optimizer(
     adam_betas=ADAM_BETAS,
     matrix_lr=MATRIX_LR,
     weight_decay=WEIGHT_DECAY,
+    muon_enabled=runtime.muon_enabled,
 )
 
-model = torch.compile(model, dynamic=False)
+if runtime.compile_enabled:
+    model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+train_loader = make_dataloader(
+    tokenizer,
+    device_batch_size,
+    MAX_SEQ_LEN,
+    "train",
+    device=device.type,
+    tokenizer_threads=runtime.tokenizer_threads,
+)
 x, y, epoch = next(train_loader)  # prefetch first batch
 
-print(f"Time budget: {TIME_BUDGET}s")
+print(f"Time budget: {time_budget_seconds}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
 
-# Schedules (all based on progress = training_time / TIME_BUDGET)
+# Schedules (all based on progress = training_time / time_budget_seconds)
 
 def get_lr_multiplier(progress):
     if progress < WARMUP_RATIO:
@@ -541,7 +1077,8 @@ total_training_time = 0
 step = 0
 
 while True:
-    torch.cuda.synchronize()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
@@ -552,7 +1089,7 @@ while True:
         x, y, epoch = next(train_loader)
 
     # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    progress = min(total_training_time / time_budget_seconds, 1.0)
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(progress)
@@ -571,7 +1108,8 @@ while True:
         print("FAIL")
         exit(1)
 
-    torch.cuda.synchronize()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
 
@@ -583,9 +1121,13 @@ while True:
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
+    tok_per_sec = int(total_batch_size / dt)
+    mfu = (
+        100 * num_flops_per_token * total_batch_size / dt / H100_BF16_PEAK_FLOPS
+        if device.type == "cuda"
+        else 0.0
+    )
+    remaining = max(0, time_budget_seconds - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
@@ -600,23 +1142,35 @@ while True:
     step += 1
 
     # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
+    if step > 10 and total_training_time >= time_budget_seconds:
         break
 
 print()  # newline after \r training log
 
-total_tokens = step * TOTAL_BATCH_SIZE
+total_tokens = step * total_batch_size
 
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    val_bpb = evaluate_bpb(
+        model,
+        tokenizer,
+        device_batch_size,
+        device=device.type,
+        tokenizer_threads=runtime.tokenizer_threads,
+    )
 
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+steady_state_mfu = (
+    100 * num_flops_per_token * total_batch_size * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS
+    if total_training_time > 0
+    else 0
+)
+if device.type != "cuda":
+    steady_state_mfu = 0.0
+peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024 if device.type == "cuda" else 0
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
@@ -627,4 +1181,4 @@ print(f"mfu_percent:      {steady_state_mfu:.2f}")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+print(f"depth:            {depth}")
